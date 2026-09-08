@@ -6,8 +6,13 @@ import asyncio
 import json
 import time
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from lightrag.base import QueryParam
+from lightrag.api.collection_context import (
+    COLLECTION_NAME_MAX_LENGTH,
+    normalize_collection_name,
+    resolve_collection_rag,
+)
 from lightrag.api.input_limits import count_conversation_input_chars
 from lightrag.api.utils_api import get_combined_auth_dependency, internal_server_error
 from lightrag.constants import (
@@ -28,6 +33,13 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class QueryRequest(BaseModel):
+    collection_name: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=COLLECTION_NAME_MAX_LENGTH,
+        description="Collection name for this user's isolated knowledge base",
+    )
+
     query: str = Field(
         max_length=MAX_QUERY_CHARS,
         description=(
@@ -174,6 +186,13 @@ class QueryRequest(BaseModel):
         # run before the strip and let "   " through.
         return validate_query_not_empty(query)
 
+    @field_validator("collection_name", mode="after")
+    @classmethod
+    def normalize_collection_name_after(cls, collection_name: str | None) -> str | None:
+        return (
+            normalize_collection_name(collection_name) if collection_name is not None else None
+        )
+
     @field_validator("hl_keywords", "ll_keywords", mode="after")
     @classmethod
     def keywords_length_check(cls, keywords: list[str]) -> list[str]:
@@ -262,13 +281,32 @@ class QueryRequest(BaseModel):
         # Exclude API-level parameters that don't belong in QueryParam
         request_data = self.model_dump(
             exclude_none=True,
-            exclude={"query", "include_chunk_content", "include_progress"},
+            exclude={
+                "query",
+                "collection_name",
+                "include_chunk_content",
+                "include_progress",
+            },
         )
 
         # Ensure `mode` and `stream` are set explicitly
         param = QueryParam(**request_data)
         param.stream = is_stream
         return param
+
+
+class CollectionQueryRequest(QueryRequest):
+    """HTTP query payload with a mandatory collection selector.
+
+    ``QueryRequest`` remains constructible without the selector for SDK and
+    unit-test compatibility; the HTTP routes use this stricter schema.
+    """
+
+    collection_name: str = Field(
+        min_length=1,
+        max_length=COLLECTION_NAME_MAX_LENGTH,
+        description="Collection name for this user's isolated knowledge base",
+    )
 
 
 class ReferenceItem(BaseModel):
@@ -364,7 +402,9 @@ class StreamChunkResponse(BaseModel):
     )
 
 
-def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
+def create_query_routes(
+    rag, api_key: Optional[str] = None, top_k: int = 60, rag_resolver=None
+):
     # Fresh router per call. A module-level instance would accumulate
     # duplicate routes when the factory is invoked more than once in the
     # same process (e.g. across tests), which triggers FastAPI's
@@ -372,6 +412,11 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
     router = APIRouter(tags=["query"])
 
     combined_auth = get_combined_auth_dependency(api_key)
+
+    async def resolve_request_rag(http_request: Request, collection_name: str):
+        return await resolve_collection_rag(
+            http_request, collection_name, rag_resolver, rag
+        )
 
     @router.post(
         "/query",
@@ -515,7 +560,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text(request: QueryRequest):
+    async def query_text(request: CollectionQueryRequest, http_request: Request):
         """
         Comprehensive RAG query endpoint with non-streaming response. Parameter "stream" is ignored.
 
@@ -591,6 +636,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 - 422: Request validation failed (e.g., query empty or too short)
                 - 500: Internal processing error (e.g., LLM service unavailable)
         """
+        rag = await resolve_request_rag(http_request, request.collection_name)
         try:
             param = request.to_query_params(
                 False
@@ -834,7 +880,9 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text_stream(request: QueryRequest):
+    async def query_text_stream(
+        request: CollectionQueryRequest, http_request: Request
+    ):
         """
         Advanced RAG query endpoint with flexible streaming response.
 
@@ -985,6 +1033,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             This endpoint is ideal for applications requiring flexible response delivery.
             Use streaming mode for real-time interfaces and non-streaming for batch processing.
         """
+        rag = await resolve_request_rag(http_request, request.collection_name)
         try:
             # Use the stream parameter from the request, defaulting to True if not specified
             stream_mode = request.stream if request.stream is not None else True
@@ -1420,7 +1469,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_data(request: QueryRequest):
+    async def query_data(request: CollectionQueryRequest, http_request: Request):
         """
         Advanced data retrieval endpoint for structured RAG analysis.
 
@@ -1523,6 +1572,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             This endpoint always includes references regardless of the include_references parameter,
             as structured data analysis typically requires source attribution.
         """
+        rag = await resolve_request_rag(http_request, request.collection_name)
         try:
             param = request.to_query_params(False)  # No streaming for data endpoint
             response = await rag.aquery_data(request.query, param=param)

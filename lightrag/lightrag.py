@@ -39,6 +39,7 @@ from lightrag.prompt import (
     PROMPTS,
     get_default_entity_extraction_prompt_profile,
     load_user_prompt_prefix_source,
+    normalize_entity_extraction_prompt_override,
     resolve_entity_extraction_prompt_profile,
     validate_entity_extraction_prompt_profile_for_mode,
 )
@@ -957,6 +958,11 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         init=False,
         repr=False,
     )
+    _request_entity_extraction_profiles: dict[str, dict[str, Any]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     # Storages Management
     # ---
@@ -1188,6 +1194,39 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         self._cached_entity_extraction_use_json = self.entity_extraction_use_json
         self._addon_params_dirty = False
 
+    def _set_request_entity_extraction_profile(
+        self, doc_ids: list[str], profile: Mapping[str, Any]
+    ) -> None:
+        """Keep a request-scoped extraction profile out of persistent storage."""
+
+        detached_profile = {
+            "entity_types_guidance": str(profile["entity_types_guidance"]),
+            "entity_extraction_examples": list(
+                profile["entity_extraction_examples"]
+            ),
+            "entity_extraction_json_examples": list(
+                profile["entity_extraction_json_examples"]
+            ),
+        }
+        for doc_id in doc_ids:
+            self._request_entity_extraction_profiles[doc_id] = detached_profile.copy()
+
+    def _pop_request_entity_extraction_profile(
+        self, doc_id: str
+    ) -> dict[str, Any] | None:
+        """Consume the temporary profile when a document reaches extraction."""
+
+        return self._request_entity_extraction_profiles.pop(doc_id, None)
+
+    def _normalize_request_entity_extraction_profile(
+        self, ontology: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Validate an API ontology against this instance's extraction mode."""
+
+        return normalize_entity_extraction_prompt_override(
+            ontology, self.entity_extraction_use_json
+        )
+
     def _ensure_addon_params_cache(self) -> None:
         if (
             not self._addon_params_dirty
@@ -1216,6 +1255,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         global_config.pop("_addon_params", None)
         global_config.pop("_addon_params_dirty", None)
         global_config.pop("_cached_entity_extraction_use_json", None)
+        global_config.pop("_request_entity_extraction_profiles", None)
         global_config["addon_params"] = dict(self._addon_params)
         # Inject runtime per-role wrapped LLM funcs (callable; not part of asdict
         # because they live in the private _role_llm_states map). The first
@@ -3246,11 +3286,29 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         pipeline_status=None,
         pipeline_status_lock=None,
         truncation_tally: TokenLimitTruncationTally | None = None,
+        entity_extraction_prompt_profile: Mapping[str, Any] | None = None,
     ) -> list:
         try:
+            global_config = self._build_global_config()
+            if entity_extraction_prompt_profile is not None:
+                global_config["_entity_extraction_prompt_profile"] = {
+                    "entity_types_guidance": entity_extraction_prompt_profile[
+                        "entity_types_guidance"
+                    ],
+                    "entity_extraction_examples": list(
+                        entity_extraction_prompt_profile[
+                            "entity_extraction_examples"
+                        ]
+                    ),
+                    "entity_extraction_json_examples": list(
+                        entity_extraction_prompt_profile[
+                            "entity_extraction_json_examples"
+                        ]
+                    ),
+                }
             chunk_results = await extract_entities(
                 chunk,
-                global_config=self._build_global_config(),
+                global_config=global_config,
                 pipeline_status=pipeline_status,
                 pipeline_status_lock=pipeline_status_lock,
                 llm_response_cache=self.llm_response_cache,

@@ -543,6 +543,74 @@ def get_default_entity_extraction_prompt_profile() -> EntityExtractionPromptProf
     }
 
 
+def normalize_entity_extraction_prompt_override(
+    value: Mapping[str, Any], use_json: bool
+) -> EntityExtractionPromptProfile:
+    """Validate a request-scoped entity extraction ontology.
+
+    Request overrides use the same three fields as the YAML prompt profile. The
+    examples required by the active extraction mode must be supplied; fields
+    for the inactive mode may be omitted and fall back to the built-in profile.
+    The returned profile is detached from the request mapping so it can safely
+    be used by an asynchronous document-processing task.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ValueError("ontology must be a JSON object")
+
+    allowed_keys = {
+        "entity_types_guidance",
+        "entity_extraction_examples",
+        "entity_extraction_json_examples",
+    }
+    unknown_keys = sorted(set(value) - allowed_keys)
+    if unknown_keys:
+        raise ValueError(
+            "ontology contains unknown field(s): " + ", ".join(unknown_keys)
+        )
+
+    profile = get_default_entity_extraction_prompt_profile()
+    guidance = value.get("entity_types_guidance")
+    if guidance is not None:
+        if not isinstance(guidance, str) or not guidance.strip():
+            raise ValueError(
+                "ontology.entity_types_guidance must be a non-empty string"
+            )
+        profile["entity_types_guidance"] = guidance.rstrip()
+
+    for field_name in (
+        "entity_extraction_examples",
+        "entity_extraction_json_examples",
+    ):
+        if field_name not in value:
+            continue
+        examples = value[field_name]
+        if not isinstance(examples, list) or not examples:
+            raise ValueError(f"ontology.{field_name} must be a non-empty list")
+        normalized: list[str] = []
+        for index, example in enumerate(examples):
+            if not isinstance(example, str) or not example.strip():
+                raise ValueError(
+                    f"ontology.{field_name}[{index}] must be a non-empty string"
+                )
+            normalized.append(example.rstrip())
+        profile[field_name] = normalized
+
+    required_examples_key = (
+        "entity_extraction_json_examples"
+        if use_json
+        else "entity_extraction_examples"
+    )
+    if required_examples_key not in value:
+        mode_name = "JSON" if use_json else "non-JSON"
+        raise ValueError(
+            f"ontology.{required_examples_key} is required when entity extraction "
+            f"uses {mode_name} mode"
+        )
+
+    return profile
+
+
 _ALLOWED_PROMPT_SUFFIXES = frozenset({".yml", ".yaml"})
 _DEFAULT_PROMPT_DIR = "./prompts"
 _ENTITY_TYPE_SUBDIR = "entity_type"

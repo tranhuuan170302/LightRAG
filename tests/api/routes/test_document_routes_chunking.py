@@ -722,6 +722,7 @@ def test_insert_texts_forwards_chunking(monkeypatch):
         headers=_HEADERS,
         json={
             "texts": ["one", "two"],
+            "collection_name": "test",
             "file_sources": ["a.md", "b.md"],
             "chunking": {"strategy": "semantic_vector", "params": {"buffer_size": 2}},
         },
@@ -757,6 +758,7 @@ def test_insert_text_without_chunking_forwards_none(monkeypatch):
             "/documents/texts",
             {
                 "texts": ["hello"],
+                "collection_name": "test",
                 "file_sources": ["a.md"],
                 "chunking": {"strategy": "custom"},
             },
@@ -814,6 +816,7 @@ def test_text_ingress_accepts_custom_with_an_injected_callback(monkeypatch):
             "/documents/texts",
             {
                 "texts": ["one", "two"],
+                "collection_name": "test",
                 "file_sources": ["a.md", "b.md"],
                 "chunking": {
                     "strategy": "custom",
@@ -933,6 +936,7 @@ def test_insert_text_returns_422_when_size_below_inherited_overlap(monkeypatch):
             "/documents/texts",
             {
                 "texts": ["hello"],
+                "collection_name": "test",
                 "file_sources": ["a.md"],
                 "chunking": {
                     "strategy": "fixed_token",

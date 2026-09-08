@@ -50,6 +50,7 @@ dependencies = [
     # 3.2.0 is the minimum pandas 3.x declares for its xlsxwriter Excel
     # engine (pandas.compat._optional.VERSIONS).
     "xlsxwriter>=3.2.0",
+    "pymilvus>=3.0.0",
 ]
 
 [project.optional-dependencies]

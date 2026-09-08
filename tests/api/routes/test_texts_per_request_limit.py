@@ -81,6 +81,7 @@ def _post(client, count):
         headers=_HEADERS,
         json={
             "texts": [f"text {i}" for i in range(count)],
+            "collection_name": "test",
             "file_sources": [f"doc-{i}.md" for i in range(count)],
         },
     )

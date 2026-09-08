@@ -671,6 +671,7 @@ class _PipelineMixin:
         parse_engine: str | list[str] | None = None,
         process_options: str | list[str] | None = None,
         chunk_options: dict | list[dict] | None = None,
+        ontology: dict[str, Any] | None = None,
         admission_token: str | None = None,
         from_scan: bool = False,
     ) -> str:
@@ -723,6 +724,10 @@ class _PipelineMixin:
                 :func:`lightrag.utils_pipeline.apply_trusted_sentence_split_regex`
                 and GHSA-32jh-39m7-8x84.  See
                 ``docs/FileProcessingPipeline.md`` for the schema.
+            ontology: optional request-scoped entity extraction prompt profile.
+                It is validated against the active extraction mode and kept in
+                memory only until the document reaches KG extraction; it is
+                intentionally not persisted in ``full_docs`` or ``doc_status``.
             admission_token: the pending-enqueue reservation the caller already
                 holds (endpoints reserve one before reading the request body).
                 With ``MAX_PENDING_DOCUMENTS > 0`` the admission guard
@@ -754,6 +759,12 @@ class _PipelineMixin:
                 newly-enqueued doc mid-batch (feeder) or at the batch
                 boundary (quiescence decision).
         """
+        normalized_ontology = None
+        if ontology is not None:
+            normalized_ontology = self._normalize_request_entity_extraction_profile(
+                ontology
+            )
+
         # Concurrency contract: enqueue may proceed concurrently with the
         # processing loop because (a) full_docs is upserted before
         # doc_status, so a consistency check never sees a ghost row, and
@@ -1494,6 +1505,10 @@ class _PipelineMixin:
                     )
             else:
                 logger.debug(f"Stored {len(new_docs)} new unique documents")
+                if normalized_ontology is not None:
+                    self._set_request_entity_extraction_profile(
+                        list(new_docs), normalized_ontology
+                    )
 
         if status_upsert_error is not None:
             if process_after_status_error:
@@ -4780,6 +4795,10 @@ class _PipelineMixin:
         extraction_meta: dict[str, Any] = {}
         chunk_results: list = []
         doc_process_opts = parse_process_options("")
+        pop_ontology = getattr(
+            self, "_pop_request_entity_extraction_profile", lambda _doc_id: None
+        )
+        request_ontology = pop_ontology(doc_id)
         # Document-scoped truncation record, fed by both KG stages (extraction
         # + gleaning in extract_entities, description summaries in
         # merge_nodes_and_edges). Stamped into doc_status.metadata at the
@@ -5435,12 +5454,19 @@ class _PipelineMixin:
                     chunk_results = []
                     extraction_meta["skip_kg"] = True
                 else:
+                    extraction_kwargs = {
+                        "truncation_tally": truncation_tally,
+                    }
+                    if request_ontology is not None:
+                        extraction_kwargs[
+                            "entity_extraction_prompt_profile"
+                        ] = request_ontology
                     entity_relation_task = asyncio.create_task(
                         self._process_extract_entities(
                             chunks,
                             ctx.pipeline_status,
                             ctx.pipeline_status_lock,
-                            truncation_tally=truncation_tally,
+                            **extraction_kwargs,
                         )
                     )
                     chunk_results = await entity_relation_task

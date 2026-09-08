@@ -39,13 +39,12 @@ from .admission import AdmissionTicket, publish_admission_ticket
 from .asgi_helpers import bearer_token, header_value, send_json
 from .utils_api import credentials_accepted, get_route_path, path_is_whitelisted
 
-# Ingestion routes that accept a body and create documents. ``/documents/scan``
-# is absent on purpose: it takes no body and is exempt from capacity by design
-# (§9.1).
+# Ingestion routes whose workspace is known before the body is read. Collection
+# aware upload/texts requests are intentionally absent: their workspace is
+# encoded in the request body, so reserving the fixed startup RAG here would
+# charge the wrong workspace. Those routes reserve after body validation.
 ADMISSION_PATHS: tuple[str, ...] = (
-    "/documents/upload",
     "/documents/text",
-    "/documents/texts",
 )
 
 

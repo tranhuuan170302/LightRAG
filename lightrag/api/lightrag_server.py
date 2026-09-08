@@ -60,6 +60,10 @@ from lightrag.api.routers.document_routes import (
     DocumentManager,
     create_document_routes,
 )
+from lightrag.api.collection_context import (
+    CollectionRAGManager,
+    clone_rag_for_workspace,
+)
 from lightrag.parser.docx.smart_heading.nlp import SmartHeadingNLPError
 from lightrag.parser.plugins import load_third_party_parsers
 from lightrag.parser.routing import (
@@ -1630,6 +1634,10 @@ def create_app(args):
                 app.state.background_tasks
             )
 
+            # Request-created collection instances own their storage handles
+            # and must be finalized before shared storage is torn down.
+            await collection_rags.close()
+
             # Clean up database connections
             await rag.finalize_storages()
 
@@ -2527,18 +2535,32 @@ def create_app(args):
 
     _log_role_provider_options(rag)
 
-    rag.register_role_llm_builder(
-        lambda role, meta: (
-            create_role_llm_func(role, meta),
-            create_role_llm_model_kwargs(role, meta),
+    def configure_role_llm_builder(target_rag):
+        target_rag.register_role_llm_builder(
+            lambda role, meta: (
+                create_role_llm_func(role, meta),
+                create_role_llm_model_kwargs(role, meta),
+            )
         )
+
+    configure_role_llm_builder(rag)
+    collection_rags = CollectionRAGManager(
+        lambda workspace: clone_rag_for_workspace(rag, workspace),
+        configure_rag=configure_role_llm_builder,
     )
+    app.state.collection_rags = collection_rags
 
     # Add routes
     # root_path is set on the app for reverse proxy support;
     # routes stay at their natural paths and are prefixed by the proxy or uvicorn --root-path
-    app.include_router(create_document_routes(rag, doc_manager, api_key))
-    app.include_router(create_query_routes(rag, api_key, args.top_k))
+    app.include_router(
+        create_document_routes(
+            rag, doc_manager, api_key, rag_resolver=collection_rags.get
+        )
+    )
+    app.include_router(
+        create_query_routes(rag, api_key, args.top_k, rag_resolver=collection_rags.get)
+    )
     app.include_router(create_graph_routes(rag, api_key))
     # Public read-only customization surface — registered unconditionally:
     # without a bundle it answers 200 {"customized": false, ...}.

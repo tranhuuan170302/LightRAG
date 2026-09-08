@@ -408,6 +408,18 @@ def get_combined_auth_dependency(
             name="X-API-Key", auto_error=False, description="API Key Authentication"
         )
 
+    def set_request_user(request: Request, token_info: dict | None = None) -> None:
+        """Expose the authenticated principal to request-scoped API handlers."""
+        username = token_info.get("username") if token_info else None
+        # API-key-only deployments have no user claim. Keep a stable fallback
+        # for collection routing; JWT-authenticated deployments always use the
+        # principal from the validated token.
+        state = getattr(request, "state", None)
+        if state is not None:
+            state.user_id = username or (
+                "api_key" if api_key_configured else "anonymous"
+            )
+
     async def combined_dependency(
         request: Request,
         response: Response,  # Added: needed to return new token via response header
@@ -422,6 +434,7 @@ def get_combined_auth_dependency(
         # renewal skip list below are written as unprefixed route paths.
         path = get_route_path(request.scope)
         if respect_whitelist and path_is_whitelisted(request.scope):
+            set_request_user(request)
             return  # Whitelist path, allow access
 
         # 2. Validate token first if provided in the request (Ensure 401 error if token is invalid)
@@ -450,6 +463,7 @@ def get_combined_auth_dependency(
                 # through so the API key stays mandatory in that mode.
                 if not auth_configured and token_info.get("role") == "guest":
                     if not api_key_configured:
+                        set_request_user(request, token_info)
                         _renew_token_if_needed(path, response, token_info)
                         return
                     # API-key-only mode: ignore the guest token; the X-API-Key check
@@ -458,6 +472,7 @@ def get_combined_auth_dependency(
                     # not authenticate anything.
                 elif auth_configured and token_info.get("role") != "guest":
                     # Accept non-guest token if password auth is configured
+                    set_request_user(request, token_info)
                     _renew_token_if_needed(path, response, token_info)
                     return
                 else:
@@ -474,6 +489,7 @@ def get_combined_auth_dependency(
 
         # 3. Acept all request if no API protection needed
         if not auth_configured and not api_key_configured:
+            set_request_user(request)
             return
 
         # 4. Validate API key if provided and API-Key authentication is configured
@@ -492,6 +508,16 @@ def get_combined_auth_dependency(
             # reaches the bookkeeping (GHSA-3wg5-5w54-3rfm).
             if token_info is not None:
                 _renew_token_if_needed(path, response, token_info)
+            token_principal = token_info
+            if (
+                not auth_configured
+                and token_info is not None
+                and token_info.get("role") == "guest"
+            ):
+                # In API-key-only mode the guest token is deliberately ignored;
+                # it must not become the tenant identity for collection routing.
+                token_principal = None
+            set_request_user(request, token_principal)
             return  # API key validation successful
 
         ### Authentication failed ####

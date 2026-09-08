@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 import errno
+import json
 import math
 import os
 import re
@@ -42,6 +43,7 @@ from fastapi import (
     APIRouter,
     Depends,
     File,
+    Form,
     HTTPException,
     Query,
     Request,
@@ -53,12 +55,19 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    ValidationError,
     field_validator,
     model_validator,
 )
 
 from lightrag import LightRAG
 from lightrag.api.utils_api import internal_server_error
+from lightrag.api.collection_context import (
+    COLLECTION_NAME_MAX_LENGTH,
+    normalize_collection_name,
+    resolve_collection_rag,
+)
+from lightrag.prompt import normalize_entity_extraction_prompt_override
 from lightrag.base import (
     CURSOR_START,
     CursorAfter,
@@ -802,6 +811,43 @@ class TextChunkingConfig(BaseModel):
         return self
 
 
+class OntologyRequest(BaseModel):
+    """Optional request-scoped entity extraction prompt profile."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    entity_types_guidance: Optional[str] = Field(
+        default=None,
+        description="Entity type guidance used during extraction",
+    )
+    entity_extraction_examples: Optional[list[str]] = Field(
+        default=None,
+        min_length=1,
+        description="Delimiter-based extraction examples",
+    )
+    entity_extraction_json_examples: Optional[list[str]] = Field(
+        default=None,
+        min_length=1,
+        description="JSON extraction examples",
+    )
+
+    @field_validator("entity_types_guidance")
+    @classmethod
+    def validate_guidance(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("entity_types_guidance must be a non-empty string")
+        return value.rstrip() if value is not None else None
+
+    @field_validator(
+        "entity_extraction_examples", "entity_extraction_json_examples"
+    )
+    @classmethod
+    def validate_examples(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None and any(not example.strip() for example in value):
+            raise ValueError("ontology examples must contain non-empty strings")
+        return [example.rstrip() for example in value] if value is not None else None
+
+
 class InsertTextRequest(BaseModel):
     """Request model for inserting a single text document
 
@@ -868,11 +914,25 @@ class InsertTextsRequest(BaseModel):
     Attributes:
         texts: List of text contents to be inserted into the RAG system
         file_sources: Sources of the texts (optional)
+        collection_name: User-selected knowledge-base collection
     """
 
     texts: list[str] = Field(
         min_length=1,
         description="The texts to insert",
+    )
+    collection_name: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=COLLECTION_NAME_MAX_LENGTH,
+        description="Collection name for this user's isolated knowledge base",
+    )
+    ontology: Optional[OntologyRequest] = Field(
+        default=None,
+        description=(
+            "Optional request-scoped ontology. The active extraction mode "
+            "requires its corresponding examples field."
+        ),
     )
     file_sources: Optional[list[str]] = Field(
         default=None, min_length=0, description="Sources of the texts"
@@ -889,6 +949,13 @@ class InsertTextsRequest(BaseModel):
         if any(not text for text in stripped):
             raise ValueError("texts cannot contain empty or whitespace-only entries")
         return stripped
+
+    @field_validator("collection_name", mode="after")
+    @classmethod
+    def normalize_collection_name_after(cls, collection_name: str | None) -> str | None:
+        return (
+            normalize_collection_name(collection_name) if collection_name is not None else None
+        )
 
     @field_validator("file_sources", mode="before")
     @classmethod
@@ -920,6 +987,16 @@ class InsertTextsRequest(BaseModel):
                 },
             }
         }
+    )
+
+
+class CollectionInsertTextsRequest(InsertTextsRequest):
+    """HTTP batch-insert payload with a mandatory collection selector."""
+
+    collection_name: str = Field(
+        min_length=1,
+        max_length=COLLECTION_NAME_MAX_LENGTH,
+        description="Collection name for this user's isolated knowledge base",
     )
 
 
@@ -2284,6 +2361,7 @@ async def pipeline_enqueue_file(
     from_scan: bool = False,
     admission_token: str | None = None,
     known_file_size: int | None = None,
+    ontology: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
     """Add a file to the queue for processing
 
@@ -2303,6 +2381,7 @@ async def pipeline_enqueue_file(
             candidate spool recorded at discovery time; it feeds error reports
             only, so a size that went stale between discovery and enqueue costs
             nothing.
+        ontology: optional request-scoped entity extraction prompt profile.
     Returns:
         tuple: (success: bool, track_id: str)
     """
@@ -2421,6 +2500,8 @@ async def pipeline_enqueue_file(
                 enqueue_kwargs["admission_token"] = admission_token
             if hint_chunk_options is not None:
                 enqueue_kwargs["chunk_options"] = hint_chunk_options
+            if ontology is not None:
+                enqueue_kwargs["ontology"] = ontology
             enqueue_result = await rag.apipeline_enqueue_documents("", **enqueue_kwargs)
             if enqueue_result is None:
                 try:
@@ -2482,6 +2563,7 @@ async def pipeline_index_file(
     file_path: Path,
     track_id: str = None,
     admission_token: str | None = None,
+    ontology: dict[str, Any] | None = None,
 ):
     """Index a file with track_id
 
@@ -2492,10 +2574,14 @@ async def pipeline_index_file(
         admission_token: the endpoint's pending-enqueue reservation, forwarded
             so the admission guard re-weights THAT token to the deduped count
             instead of counting this request twice (LR2 §9.2)
+        ontology: optional request-scoped entity extraction prompt profile
     """
     try:
+        enqueue_kwargs = {"admission_token": admission_token}
+        if ontology is not None:
+            enqueue_kwargs["ontology"] = ontology
         success, _ = await pipeline_enqueue_file(
-            rag, file_path, track_id, admission_token=admission_token
+            rag, file_path, track_id, **enqueue_kwargs
         )
         if success:
             await rag.apipeline_process_enqueue_documents()
@@ -2714,6 +2800,7 @@ async def pipeline_index_texts(
     chunking: Optional[TextChunkingConfig] = None,
     resolved_chunking: Optional[tuple[str, dict]] = None,
     admission_token: str | None = None,
+    ontology: dict[str, Any] | None = None,
 ):
     """Index a list of texts with track_id
 
@@ -2731,6 +2818,7 @@ async def pipeline_index_texts(
         admission_token: the endpoint's pending-enqueue reservation, forwarded so
             the admission guard re-weights that token to the deduped count
             (LR2 §9.2)
+        ontology: optional request-scoped entity extraction prompt profile
     """
     if not texts:
         return
@@ -2755,6 +2843,8 @@ async def pipeline_index_texts(
         "process_options": process_options,
         "chunk_options": chunk_options,
     }
+    if ontology is not None:
+        enqueue_kwargs["ontology"] = ontology
     if admission_token is not None:
         # See pipeline_enqueue_file: only forwarded when a reservation exists.
         enqueue_kwargs["admission_token"] = admission_token
@@ -4394,8 +4484,51 @@ async def background_delete_documents(
                 logger.error(f"Error processing pending documents after deletion: {e}")
 
 
+def _normalize_ontology_request(
+    ontology: OntologyRequest | None, rag: LightRAG
+) -> dict[str, Any] | None:
+    """Validate and detach an optional request ontology for pipeline use."""
+
+    if ontology is None:
+        return None
+    try:
+        return normalize_entity_extraction_prompt_override(
+            ontology.model_dump(exclude_none=True),
+            bool(getattr(rag, "entity_extraction_use_json", False)),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid ontology: {exc}") from exc
+
+
+def _parse_upload_ontology(
+    ontology: str | None, rag: LightRAG
+) -> dict[str, Any] | None:
+    """Parse the JSON-string ontology field carried by multipart uploads."""
+
+    if ontology is None or not isinstance(ontology, str) or not ontology.strip():
+        return None
+    try:
+        payload = json.loads(ontology)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid ontology: upload ontology must be a JSON object",
+        ) from exc
+    try:
+        request_ontology = OntologyRequest.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid ontology: {exc.errors(include_url=False)}",
+        ) from exc
+    return _normalize_ontology_request(request_ontology, rag)
+
+
 def create_document_routes(
-    rag: LightRAG, doc_manager: DocumentManager, api_key: Optional[str] = None
+    rag: LightRAG,
+    doc_manager: DocumentManager,
+    api_key: Optional[str] = None,
+    rag_resolver=None,
 ):
     # Fresh router per call — see the note above the temp_prefix constant.
     router = APIRouter(
@@ -4405,6 +4538,11 @@ def create_document_routes(
 
     # Create combined auth dependency for document routes
     combined_auth = get_combined_auth_dependency(api_key)
+
+    async def resolve_request_rag(http_request: Request, collection_name: str):
+        return await resolve_collection_rag(
+            http_request, collection_name, rag_resolver, rag
+        )
 
     @router.post(
         "/scan", response_model=ScanResponse, dependencies=[Depends(combined_auth)]
@@ -5127,6 +5265,18 @@ def create_document_routes(
     async def upload_to_input_dir(
         managed_tasks: set = Depends(get_managed_background_tasks),
         file: UploadFile = File(...),
+        collection_name: str = Form(
+            ...,
+            min_length=1,
+            max_length=COLLECTION_NAME_MAX_LENGTH,
+            description="Collection name for this user's isolated knowledge base",
+        ),
+        ontology: str | None = Form(
+            default=None,
+            description=(
+                "Optional ontology JSON object serialized as a multipart form field"
+            ),
+        ),
         http_request: Request = None,
     ):
         """
@@ -5207,6 +5357,18 @@ def create_document_routes(
         """
         from lightrag.kg.shared_storage import start_reserved_background_task
 
+        rag = await resolve_request_rag(http_request, collection_name)
+        # Direct endpoint unit tests invoke the function without FastAPI
+        # dependency injection, in which case the ``Form(...)`` sentinel is
+        # still present. Preserve their startup document manager; real HTTP
+        # requests always supply a validated collection string here.
+        workspace_doc_manager = (
+            DocumentManager(str(doc_manager.base_input_dir), workspace=rag.workspace)
+            if isinstance(collection_name, str)
+            else doc_manager
+        )
+        normalized_ontology = _parse_upload_ontology(ontology, rag)
+
         enqueue_token, admission_adopted = _adopt_or_new_enqueue_token(http_request)
         handed_off = False
         try:
@@ -5224,7 +5386,9 @@ def create_document_routes(
                 await _reserve_enqueue_slot(rag, enqueue_token)
 
             # Sanitize filename to prevent Path Traversal attacks
-            safe_filename = sanitize_filename(file.filename, doc_manager.input_dir)
+            safe_filename = sanitize_filename(
+                file.filename, workspace_doc_manager.input_dir
+            )
 
             # Resolve engine + process options once and reuse the result for
             # both gates below; each resolution costs a hint parse plus a
@@ -5237,12 +5401,12 @@ def create_document_routes(
                 # document after the upload was accepted).
                 raise HTTPException(status_code=400, detail=str(hint_error))
 
-            if not doc_manager.is_supported_file(
+            if not workspace_doc_manager.is_supported_file(
                 safe_filename, directives=upload_directives
             ):
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Unsupported file type. Supported types: {doc_manager.supported_extensions}",
+                    detail=f"Unsupported file type. Supported types: {workspace_doc_manager.supported_extensions}",
                 )
 
             # Unlike scans/reprocessing, this request has a caller to correct
@@ -5279,7 +5443,7 @@ def create_document_routes(
                         f"File size not available in UploadFile for {safe_filename}, will check during streaming"
                     )
 
-            file_path = doc_manager.input_dir / safe_filename
+            file_path = workspace_doc_manager.input_dir / safe_filename
 
             # Strict name pre-check.  Both the INPUT directory and doc_status
             # must be free of any same-canonical-basename record before we
@@ -5306,7 +5470,7 @@ def create_document_routes(
                 existing_input_file: Path | None = file_path
             else:
                 existing_input_file = find_existing_file_by_file_path(
-                    doc_manager.input_dir, canonical_filename
+                    workspace_doc_manager.input_dir, canonical_filename
                 )
             if existing_input_file:
                 raise HTTPException(
@@ -5323,7 +5487,7 @@ def create_document_routes(
             chunk_size = 1024 * 1024  # 1MB chunks
             needs_cleanup = False
 
-            upload_opener = upload_file_opener(doc_manager.input_dir)
+            upload_opener = upload_file_opener(workspace_doc_manager.input_dir)
             out_file_context = aiofiles.open(file_path, "xb", opener=upload_opener)
 
             opened = False
@@ -5410,12 +5574,12 @@ def create_document_routes(
                 # cancellation therefore cannot strand the enqueue slot.
                 started.set()
                 try:
-                    await pipeline_index_file(
-                        rag,
-                        file_path,
-                        track_id,
-                        admission_token=enqueue_token,
-                    )
+                    index_kwargs = {
+                        "admission_token": enqueue_token,
+                    }
+                    if normalized_ontology is not None:
+                        index_kwargs["ontology"] = normalized_ontology
+                    await pipeline_index_file(rag, file_path, track_id, **index_kwargs)
                 finally:
                     await _release_enqueue_slot(rag, enqueue_token)
 
@@ -5588,7 +5752,7 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
     )
     async def insert_texts(
-        request: InsertTextsRequest,
+        request: CollectionInsertTextsRequest,
         managed_tasks: set = Depends(get_managed_background_tasks),
         http_request: Request = None,
     ):
@@ -5622,6 +5786,9 @@ def create_document_routes(
                 than ``MAX_TEXTS_PER_REQUEST`` allows, 500 other errors.
         """
         from lightrag.kg.shared_storage import start_reserved_background_task
+
+        rag = await resolve_request_rag(http_request, request.collection_name)
+        normalized_ontology = _normalize_ontology_request(request.ontology, rag)
 
         enqueue_token, admission_adopted = _adopt_or_new_enqueue_token(http_request)
         handed_off = False
@@ -5709,15 +5876,16 @@ def create_document_routes(
                 # cancellation therefore cannot strand the enqueue slot.
                 started.set()
                 try:
-                    await pipeline_index_texts(
-                        rag,
-                        request.texts,
-                        file_sources=normalized_file_sources,
-                        track_id=track_id,
-                        chunking=request.chunking,
-                        resolved_chunking=resolved_chunking,
-                        admission_token=enqueue_token,
-                    )
+                    index_kwargs = {
+                        "file_sources": normalized_file_sources,
+                        "track_id": track_id,
+                        "chunking": request.chunking,
+                        "resolved_chunking": resolved_chunking,
+                        "admission_token": enqueue_token,
+                    }
+                    if normalized_ontology is not None:
+                        index_kwargs["ontology"] = normalized_ontology
+                    await pipeline_index_texts(rag, request.texts, **index_kwargs)
                 finally:
                     await _release_enqueue_slot(rag, enqueue_token)
 
