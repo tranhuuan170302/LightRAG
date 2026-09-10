@@ -67,6 +67,27 @@ async def test_qdrant_collection_naming(mock_qdrant_client, mock_embedding_func)
     assert storage.final_namespace == f"lightrag_vdb_chunks_{expected_suffix}"
 
 
+async def test_qdrant_collection_naming_uses_logical_collection_name(
+    mock_qdrant_client, mock_embedding_func
+):
+    config = {
+        "embedding_batch_num": 10,
+        "collection_name": "collection_name",
+        "vector_db_storage_cls_kwargs": {"cosine_better_than_threshold": 0.8},
+    }
+    storage = QdrantVectorDBStorage(
+        namespace="chunks",
+        global_config=config,
+        embedding_func=EmbeddingFunc(
+            embedding_dim=1536,
+            func=mock_embedding_func.func,
+            model_name="text_embeddings_small",
+        ),
+        workspace="opaque_workspace",
+    )
+    assert storage.final_namespace == "collection_name_chunk_text_embeddings_small_1536d"
+
+
 async def test_qdrant_migration_trigger(mock_qdrant_client, mock_embedding_func):
     """Test if migration logic is triggered correctly"""
     config = {

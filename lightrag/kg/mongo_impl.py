@@ -3838,7 +3838,13 @@ class MongoVectorDBStorage(BaseVectorStorage):
 
         # Build final_namespace with workspace prefix for data isolation
         # Keep original namespace unchanged for type detection logic
-        if effective_workspace:
+        if self._get_collection_prefix():
+            self.final_namespace = self._get_collection_namespace()
+            self.workspace = effective_workspace or ""
+            logger.debug(
+                f"Final namespace from logical collection name: '{self.final_namespace}'"
+            )
+        elif effective_workspace:
             self.final_namespace = f"{effective_workspace}_{self.namespace}"
             self.workspace = effective_workspace
             logger.debug(

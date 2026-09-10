@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import fields, replace
@@ -58,7 +59,9 @@ def _unwrap_priority_wrapper(value: Any) -> Any:
     return value
 
 
-def clone_rag_for_workspace(base_rag: Any, workspace: str) -> Any:
+def clone_rag_for_workspace(
+    base_rag: Any, workspace: str, *, collection_name: str | None = None
+) -> Any:
     """Construct a LightRAG instance with the base instance's configuration."""
     kwargs: dict[str, Any] = {}
     for item in fields(base_rag):
@@ -76,8 +79,19 @@ def clone_rag_for_workspace(base_rag: Any, workspace: str) -> Any:
         kwargs[item.name] = value
 
     kwargs["workspace"] = workspace
+    if collection_name is not None:
+        kwargs["collection_name"] = normalize_collection_name(collection_name)
     kwargs["addon_params"] = deepcopy(dict(base_rag.addon_params))
     return type(base_rag)(**kwargs)
+
+
+def _factory_accepts_collection_name(factory: Callable[..., Any]) -> bool:
+    """Keep the manager compatible with existing one-argument factories."""
+    try:
+        inspect.signature(factory).bind("workspace", "collection_name")
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 class CollectionRAGManager:
@@ -109,7 +123,11 @@ class CollectionRAGManager:
         async with self._lock:
             rag = self._rags.get(key)
             if rag is None:
-                rag = self._rag_factory(collection_workspace(*key))
+                workspace = collection_workspace(*key)
+                if _factory_accepts_collection_name(self._rag_factory):
+                    rag = self._rag_factory(workspace, collection_name)
+                else:
+                    rag = self._rag_factory(workspace)
                 if self._configure_rag is not None:
                     self._configure_rag(rag)
                 try:

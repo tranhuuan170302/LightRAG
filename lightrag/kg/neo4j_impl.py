@@ -112,6 +112,9 @@ class Neo4JStorage(BaseGraphStorage):
         without any risk of Cypher injection. It must NOT be interpolated
         directly into a query string.
         """
+        collection_name = self.global_config.get("collection_name")
+        if isinstance(collection_name, str) and collection_name.strip():
+            return collection_name.strip()
         workspace = self.workspace.strip()
         return workspace if workspace else "base"
 

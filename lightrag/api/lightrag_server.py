@@ -2545,7 +2545,9 @@ def create_app(args):
 
     configure_role_llm_builder(rag)
     collection_rags = CollectionRAGManager(
-        lambda workspace: clone_rag_for_workspace(rag, workspace),
+        lambda workspace, collection_name: clone_rag_for_workspace(
+            rag, workspace, collection_name=collection_name
+        ),
         configure_rag=configure_role_llm_builder,
     )
     app.state.collection_rags = collection_rags

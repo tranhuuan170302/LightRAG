@@ -419,6 +419,14 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     workspace: str = field(default_factory=lambda: os.getenv("WORKSPACE", ""))
     """Workspace for data isolation. Defaults to empty string if WORKSPACE environment variable is not set."""
 
+    collection_name: str | None = field(default=None)
+    """Optional logical name used in external storage identifiers.
+
+    API-managed collections keep an opaque ``workspace`` for tenant
+    isolation, while this value makes database collections and graph labels
+    human-readable.
+    """
+
     # ---
     # TODO: Deprecated, use setup_logger in utils.py instead
     log_level: int | None = field(default=None)

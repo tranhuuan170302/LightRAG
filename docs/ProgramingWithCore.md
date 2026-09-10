@@ -1079,6 +1079,12 @@ lightrag-server
 
 The `workspace` parameter ensures data isolation between different LightRAG instances. Once initialized, the `workspace` is immutable.
 
+API-managed collection instances also carry a logical `collection_name`. For
+Qdrant, Milvus, and MongoDB vector storage, it is used as the readable
+collection prefix (for example, `collection_name_chunk_text_embeddings_small_1536d`);
+Neo4j uses it as the graph label. The opaque workspace remains the isolation
+key, so equal collection names belonging to different users remain isolated.
+
 | Storage Type | Isolation Method |
 |---|---|
 | `JsonKVStorage`, `JsonDocStatusStorage`, `NetworkXStorage`, `NanoVectorDBStorage`, `FaissVectorDBStorage` | Workspace subdirectories |

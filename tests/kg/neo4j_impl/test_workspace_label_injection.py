@@ -41,6 +41,16 @@ def _make_storage(workspace: str) -> Neo4JStorage:
     )
 
 
+def test_collection_name_is_used_as_neo4j_label():
+    storage = Neo4JStorage(
+        namespace="chunk_entity_relation",
+        workspace="opaque_workspace",
+        global_config={"collection_name": "collection_name"},
+        embedding_func=None,
+    )
+    assert storage._get_raw_workspace_label() == "collection_name"
+
+
 # ---------------------------------------------------------------------------
 # _get_workspace_label: backtick-identifier context
 # ---------------------------------------------------------------------------

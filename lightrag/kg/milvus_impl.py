@@ -2144,7 +2144,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
         self.workspace = effective_workspace or ""
         self.model_suffix = self._generate_collection_suffix()
-        if self.workspace:
+        if self._get_collection_prefix():
+            self.legacy_namespace = self._get_collection_namespace()
+        elif self.workspace:
             self.legacy_namespace = f"{self.workspace}_{self.namespace}"
             logger.debug(
                 f"Legacy namespace with workspace prefix: '{self.legacy_namespace}'"

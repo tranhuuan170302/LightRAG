@@ -256,6 +256,30 @@ class BaseVectorStorage(StorageNameSpace, ABC):
     cosine_better_than_threshold: float = field(default=0.2)
     meta_fields: set[str] = field(default_factory=set)
 
+    def _get_collection_prefix(self) -> str | None:
+        """Return the optional logical collection name for backend identifiers."""
+        value = self.global_config.get("collection_name")
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        return value or None
+
+    def _get_collection_namespace(self) -> str:
+        """Return a readable, backend-safe namespace component."""
+        import re
+
+        namespace = {
+            "chunks": "chunk",
+            "entities": "entity",
+            "relationships": "relationship",
+        }.get(self.namespace, self.namespace)
+        prefix = self._get_collection_prefix()
+        if prefix:
+            prefix = re.sub(r"[^A-Za-z0-9_]+", "_", prefix).strip("_")
+            if prefix:
+                return f"{prefix}_{namespace}"
+        return namespace
+
     def _validate_embedding_func(self):
         """Validate the backend's embedding function requirement.
 
