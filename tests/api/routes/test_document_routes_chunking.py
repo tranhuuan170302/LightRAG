@@ -616,11 +616,13 @@ def _make_client(monkeypatch, addon_params=None, chunking_func=chunking_by_token
         chunking=None,
         resolved_chunking=None,
         admission_token=None,
+        metadata=None,
     ):
         captured["texts"] = texts
         captured["file_sources"] = file_sources
         captured["chunking"] = chunking
         captured["resolved_chunking"] = resolved_chunking
+        captured["metadata"] = metadata
 
     async def _noop_reserve(rag, token):
         return False
@@ -741,6 +743,76 @@ def test_insert_text_without_chunking_forwards_none(monkeypatch):
     )
     assert resp.status_code == 200
     assert captured["chunking"] is None
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_chunk_metadata_is_forwarded_by_text_routes(monkeypatch, batch):
+    client, captured = _make_client(monkeypatch)
+    metadata = {"department": "engineering", "tags": ["internal"]}
+    payload = (
+        {
+            "texts": ["hello", "world"],
+            "file_sources": ["a.txt", "b.txt"],
+            "collection_name": "test",
+            "metadata": [metadata, {"category": "faq"}],
+        }
+        if batch
+        else {"text": "hello", "file_source": "a.txt", "metadata": metadata}
+    )
+    response = client.post(
+        "/documents/texts" if batch else "/documents/text",
+        headers=_HEADERS,
+        json=payload,
+    )
+    assert response.status_code == 200
+    assert captured["metadata"] == payload["metadata"]
+
+
+def test_batch_metadata_length_is_rejected_before_indexing(monkeypatch):
+    client, captured = _make_client(monkeypatch)
+    response = client.post(
+        "/documents/texts",
+        headers=_HEADERS,
+        json={
+            "texts": ["hello", "world"],
+            "file_sources": ["a.txt", "b.txt"],
+            "collection_name": "test",
+            "metadata": [{"category": "faq"}],
+        },
+    )
+    assert response.status_code == 422
+    assert captured == {}
+
+
+@pytest.mark.parametrize("raw", ["not-json", "[]", "null", '{"x": NaN}', ""])
+def test_upload_metadata_rejects_invalid_json_objects(raw):
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as error:
+        _dr._parse_upload_metadata(raw)
+    assert error.value.status_code == 422
+
+
+def test_upload_metadata_accepts_custom_fields():
+    assert _dr._parse_upload_metadata('{"category": "manual", "tags": ["a"]}') == {
+        "category": "manual",
+        "tags": ["a"],
+    }
+    assert _dr._parse_upload_metadata(None) is None
+
+
+def test_pipeline_index_texts_passes_metadata_to_enqueue():
+    rag = _CallbackRemovalRag(chunking_by_token_size)
+    metadata = {"category": "manual"}
+    asyncio.run(
+        _dr.pipeline_index_texts(
+            rag,
+            ["hello"],
+            file_sources=["a.txt"],
+            metadata=metadata,
+        )
+    )
+    assert rag.enqueued[0]["metadata"] == metadata
 
 
 @pytest.mark.parametrize(

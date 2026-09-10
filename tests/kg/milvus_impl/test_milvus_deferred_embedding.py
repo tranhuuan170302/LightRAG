@@ -116,6 +116,34 @@ def _make_storage(
 
 
 @pytest.mark.asyncio
+async def test_chunk_metadata_is_flushed_alongside_default_fields():
+    embed = CountingEmbeddingFunc()
+    storage = _make_storage(
+        embed,
+        namespace="chunks",
+        meta_fields={"content", "full_doc_id", "file_path", "metadata"},
+    )
+    metadata = {"tags": ["internal"], "department": "engineering", "active": True}
+    await storage.upsert(
+        {
+            "chunk-1": {
+                "content": "Original chunk text",
+                "full_doc_id": "doc-1",
+                "file_path": "manual.txt",
+                "metadata": metadata,
+            }
+        }
+    )
+    assert (await storage.get_by_id("chunk-1"))["metadata"] == metadata
+    await storage.index_done_callback()
+    record = storage._client.upsert.call_args.kwargs["data"][0]
+    assert record["metadata"] == metadata
+    assert record["full_doc_id"] == "doc-1"
+    assert record["file_path"] == "manual.txt"
+    assert embed.texts == ["Original chunk text"]
+
+
+@pytest.mark.asyncio
 async def test_upsert_buffers_without_embedding():
     embed = CountingEmbeddingFunc()
     s = _make_storage(embed)

@@ -128,7 +128,12 @@ from lightrag.utils import (
     validate_file_path_security,
 )
 from lightrag.kg.shared_storage import append_pipeline_history
-from lightrag.utils_pipeline import count_active_documents, read_source_file_basename
+from lightrag.utils_pipeline import (
+    count_active_documents,
+    normalize_chunk_metadata,
+    normalize_chunk_metadata_batch,
+    read_source_file_basename,
+)
 from lightrag.api.admission import adopt_admission_ticket
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
@@ -862,6 +867,15 @@ class InsertTextRequest(BaseModel):
         min_length=1,
         description="The text to insert",
     )
+    metadata: dict[str, Any] | None = Field(
+        default=None, description="Custom JSON metadata copied to every chunk"
+    )
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def validate_metadata(cls, value: Any) -> dict[str, Any] | None:
+        return normalize_chunk_metadata(value) if value is not None else None
+
     file_source: Optional[str] = Field(
         default=None, min_length=0, description="File Source"
     )
@@ -921,6 +935,20 @@ class InsertTextsRequest(BaseModel):
         min_length=1,
         description="The texts to insert",
     )
+    metadata: dict[str, Any] | list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Custom chunk metadata: one shared JSON object or one object per text",
+    )
+
+    @model_validator(mode="after")
+    def validate_metadata(self) -> "InsertTextsRequest":
+        normalized = normalize_chunk_metadata_batch(self.metadata, len(self.texts))
+        if normalized is not None:
+            self.metadata = (
+                normalized[0] if isinstance(self.metadata, dict) else normalized
+            )
+        return self
+
     collection_name: Optional[str] = Field(
         default=None,
         min_length=1,
@@ -2362,6 +2390,7 @@ async def pipeline_enqueue_file(
     admission_token: str | None = None,
     known_file_size: int | None = None,
     ontology: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
     """Add a file to the queue for processing
 
@@ -2502,6 +2531,8 @@ async def pipeline_enqueue_file(
                 enqueue_kwargs["chunk_options"] = hint_chunk_options
             if ontology is not None:
                 enqueue_kwargs["ontology"] = ontology
+            if metadata is not None:
+                enqueue_kwargs["metadata"] = metadata
             enqueue_result = await rag.apipeline_enqueue_documents("", **enqueue_kwargs)
             if enqueue_result is None:
                 try:
@@ -2564,6 +2595,7 @@ async def pipeline_index_file(
     track_id: str = None,
     admission_token: str | None = None,
     ontology: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
 ):
     """Index a file with track_id
 
@@ -2575,11 +2607,14 @@ async def pipeline_index_file(
             so the admission guard re-weights THAT token to the deduped count
             instead of counting this request twice (LR2 §9.2)
         ontology: optional request-scoped entity extraction prompt profile
+        metadata: custom JSON metadata copied to each generated chunk
     """
     try:
         enqueue_kwargs = {"admission_token": admission_token}
         if ontology is not None:
             enqueue_kwargs["ontology"] = ontology
+        if metadata is not None:
+            enqueue_kwargs["metadata"] = metadata
         success, _ = await pipeline_enqueue_file(
             rag, file_path, track_id, **enqueue_kwargs
         )
@@ -2801,6 +2836,7 @@ async def pipeline_index_texts(
     resolved_chunking: Optional[tuple[str, dict]] = None,
     admission_token: str | None = None,
     ontology: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | list[dict[str, Any]] | None = None,
 ):
     """Index a list of texts with track_id
 
@@ -2819,6 +2855,7 @@ async def pipeline_index_texts(
             the admission guard re-weights that token to the deduped count
             (LR2 §9.2)
         ontology: optional request-scoped entity extraction prompt profile
+        metadata: shared custom chunk metadata or one object per text
     """
     if not texts:
         return
@@ -2845,6 +2882,8 @@ async def pipeline_index_texts(
     }
     if ontology is not None:
         enqueue_kwargs["ontology"] = ontology
+    if metadata is not None:
+        enqueue_kwargs["metadata"] = metadata
     if admission_token is not None:
         # See pipeline_enqueue_file: only forwarded when a reservation exists.
         enqueue_kwargs["admission_token"] = admission_token
@@ -4524,6 +4563,19 @@ def _parse_upload_ontology(
     return _normalize_ontology_request(request_ontology, rag)
 
 
+def _parse_upload_metadata(metadata: str | None) -> dict[str, Any] | None:
+    """Validate multipart chunk metadata before saving or scheduling a file."""
+    # Direct endpoint tests may leave the Form sentinel in place.
+    if metadata is None or not isinstance(metadata, str):
+        return None
+    try:
+        return normalize_chunk_metadata(json.loads(metadata))
+    except (ValueError, RecursionError) as exc:
+        raise HTTPException(
+            status_code=422, detail="Invalid metadata: expected a JSON object"
+        ) from exc
+
+
 def create_document_routes(
     rag: LightRAG,
     doc_manager: DocumentManager,
@@ -5277,6 +5329,10 @@ def create_document_routes(
                 "Optional ontology JSON object serialized as a multipart form field"
             ),
         ),
+        metadata: str | None = Form(
+            default=None,
+            description="Custom chunk metadata JSON object serialized as a multipart form field",
+        ),
         http_request: Request = None,
     ):
         """
@@ -5368,6 +5424,7 @@ def create_document_routes(
             else doc_manager
         )
         normalized_ontology = _parse_upload_ontology(ontology, rag)
+        normalized_metadata = _parse_upload_metadata(metadata)
 
         enqueue_token, admission_adopted = _adopt_or_new_enqueue_token(http_request)
         handed_off = False
@@ -5579,6 +5636,8 @@ def create_document_routes(
                     }
                     if normalized_ontology is not None:
                         index_kwargs["ontology"] = normalized_ontology
+                    if normalized_metadata is not None:
+                        index_kwargs["metadata"] = normalized_metadata
                     await pipeline_index_file(rag, file_path, track_id, **index_kwargs)
                 finally:
                     await _release_enqueue_slot(rag, enqueue_token)
@@ -5717,6 +5776,11 @@ def create_document_routes(
                         chunking=request.chunking,
                         resolved_chunking=resolved_chunking,
                         admission_token=enqueue_token,
+                        **(
+                            {"metadata": request.metadata}
+                            if request.metadata is not None
+                            else {}
+                        ),
                     )
                 finally:
                     await _release_enqueue_slot(rag, enqueue_token)
@@ -5885,6 +5949,8 @@ def create_document_routes(
                     }
                     if normalized_ontology is not None:
                         index_kwargs["ontology"] = normalized_ontology
+                    if request.metadata is not None:
+                        index_kwargs["metadata"] = request.metadata
                     await pipeline_index_texts(rag, request.texts, **index_kwargs)
                 finally:
                     await _release_enqueue_slot(rag, enqueue_token)

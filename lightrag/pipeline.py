@@ -134,6 +134,8 @@ from lightrag.utils_pipeline import (
     doc_status_field,
     doc_status_parse_failure_fields,
     doc_status_transition_metadata,
+    normalize_chunk_metadata,
+    normalize_chunk_metadata_batch,
     get_duplicate_doc_by_content_hash,
     get_existing_doc_by_content_hash,
     has_known_document_source,
@@ -674,6 +676,7 @@ class _PipelineMixin:
         ontology: dict[str, Any] | None = None,
         admission_token: str | None = None,
         from_scan: bool = False,
+        metadata: dict[str, Any] | list[dict[str, Any]] | None = None,
     ) -> str:
         """
         Pipeline for Processing Documents
@@ -728,6 +731,9 @@ class _PipelineMixin:
                 It is validated against the active extraction mode and kept in
                 memory only until the document reaches KG extraction; it is
                 intentionally not persisted in ``full_docs`` or ``doc_status``.
+            metadata: optional JSON object copied to every chunk's metadata,
+                or one object per input document. Persisted in doc_status as
+                chunk_metadata so parsing and manual retries retain it.
             admission_token: the pending-enqueue reservation the caller already
                 holds (endpoints reserve one before reading the request body).
                 With ``MAX_PENDING_DOCUMENTS > 0`` the admission guard
@@ -853,6 +859,7 @@ class _PipelineMixin:
             track_id = generate_track_id("enqueue")
         if isinstance(input, str):
             input = [input]
+        chunk_metadata = normalize_chunk_metadata_batch(metadata, len(input))
         if isinstance(ids, str):
             ids = [ids]
         if isinstance(file_paths, str):
@@ -1069,6 +1076,8 @@ class _PipelineMixin:
             # so the per-doc parameters are frozen even when ``F``
             # (default) is used.
             content_data["chunk_options"] = _chunk_options_at(index)
+            if chunk_metadata is not None:
+                content_data["chunk_metadata"] = chunk_metadata[index]
             contents[doc_id] = content_data
 
         # ``ids`` outranks ``docs_format`` by design: explicit ids mark the
@@ -1131,6 +1140,8 @@ class _PipelineMixin:
             metadata: dict[str, Any] = {
                 KG_WRITE_STATE_METADATA_KEY: KG_WRITE_STATE_PRE_GRAPH,
             }
+            if "chunk_metadata" in content_data:
+                metadata["chunk_metadata"] = content_data["chunk_metadata"]
             options_str = content_data.get("process_options") or ""
             if options_str:
                 # Mirror process_options into doc_status.metadata so admin UIs
@@ -5403,6 +5414,15 @@ class _PipelineMixin:
                 chunks = build_chunks_dict_from_chunking_result(
                     chunking_result, doc_id=doc_id, file_path=file_path
                 )
+                custom_metadata = (
+                    doc_status_field(status_doc, "metadata", {}) or {}
+                ).get("chunk_metadata")
+                if custom_metadata is not None:
+                    for chunk in chunks.values():
+                        chunk["metadata"] = {
+                            **normalize_chunk_metadata(custom_metadata),
+                            **normalize_chunk_metadata(chunk.get("metadata", {})),
+                        }
 
                 if not chunks:
                     logger.warning("No document chunks to process")

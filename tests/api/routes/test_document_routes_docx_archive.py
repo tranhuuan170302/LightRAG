@@ -475,6 +475,70 @@ async def test_pipeline_index_file_leaves_lightrag_document_docx_for_parser_arch
     assert rag.enqueued[0]["parse_engine"] == "native"
 
 
+async def test_file_indexing_forwards_chunk_metadata(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setenv("LIGHTRAG_PARSER", "docx:native")
+    file_path = tmp_path / "metadata.docx"
+    file_path.write_bytes(b"docx bytes")
+    rag = _FakeRag()
+    rag.apipeline_enqueue_documents = AsyncMock(return_value="track-metadata")
+    metadata = {"category": "manual", "tags": ["internal"]}
+
+    await pipeline_index_file(rag, file_path, "track-metadata", metadata=metadata)
+
+    assert rag.apipeline_enqueue_documents.call_args.kwargs["metadata"] == metadata
+    assert (
+        rag.apipeline_enqueue_documents.call_args.kwargs["docs_format"]
+        == FULL_DOCS_FORMAT_PENDING_PARSE
+    )
+
+
+async def test_upload_forwards_custom_metadata_before_background_indexing(
+    tmp_path, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    rag = _DuplicateUploadRag({})
+    doc_manager = DocumentManager(str(tmp_path))
+    index = AsyncMock()
+    monkeypatch.setattr(_document_routes, "pipeline_index_file", index)
+    router = create_document_routes(rag, doc_manager)
+    endpoint = next(
+        route.endpoint for route in router.routes if route.name == "upload_to_input_dir"
+    )
+    managed = set()
+    upload = _document_routes.UploadFile(
+        filename="metadata.txt", file=BytesIO(b"hello")
+    )
+    await endpoint(managed, upload, metadata='{"category":"manual"}')
+    await _await_managed(managed)
+    assert index.call_args.kwargs["metadata"] == {"category": "manual"}
+
+
+async def test_upload_rejects_invalid_metadata_before_saving(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    rag = _DuplicateUploadRag({})
+    index = AsyncMock()
+    monkeypatch.setattr(_document_routes, "pipeline_index_file", index)
+    router = create_document_routes(rag, DocumentManager(str(tmp_path)))
+    endpoint = next(
+        route.endpoint for route in router.routes if route.name == "upload_to_input_dir"
+    )
+    upload = _document_routes.UploadFile(
+        filename="metadata.txt", file=BytesIO(b"hello")
+    )
+    with pytest.raises(_document_routes.HTTPException) as error:
+        await endpoint(set(), upload, metadata="[]")
+    assert error.value.status_code == 422
+    assert not (tmp_path / "metadata.txt").exists()
+    index.assert_not_called()
+
+
 async def test_pipeline_enqueue_lightrag_document_docx_does_not_move_source(
     tmp_path, monkeypatch
 ):

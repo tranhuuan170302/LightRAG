@@ -387,6 +387,7 @@ def test_carry_over_keys_grouped_by_stage():
     assert _DOC_STATUS_METADATA_CARRY_OVER_KEYS == (
         "process_options",
         "source_file",
+        "chunk_metadata",
         "parse_warnings",
         "chunk_opts",
         "parse_start_time",

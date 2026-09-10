@@ -67,6 +67,49 @@ PLACEHOLDER_DOCUMENT_SOURCES = {"", "no-file-path", "unknown_source"}
 SIDECAR_LOCATION_UNKNOWN = "unknown_source"
 
 
+def normalize_chunk_metadata(metadata: Any) -> dict[str, Any]:
+    """Validate and detach a JSON object destined for chunk vector payloads.
+
+    Custom keys live under ``metadata`` so they cannot replace chunk identity,
+    content, or pipeline bookkeeping. Reject non-JSON SDK values rather than
+    silently coercing them differently in different storage backends.
+    """
+
+    def validate(value: Any) -> None:
+        if isinstance(value, dict):
+            if any(not isinstance(key, str) for key in value):
+                raise ValueError("metadata object keys must be strings")
+            for child in value.values():
+                validate(child)
+        elif isinstance(value, list):
+            for child in value:
+                validate(child)
+        elif value is not None and not isinstance(value, (str, bool, int, float)):
+            raise ValueError("metadata values must be JSON values")
+
+    if not isinstance(metadata, dict):
+        # Pydantic turns ValueError (not TypeError) into a request validation error.
+        raise ValueError("metadata must be a JSON object")  # noqa: TRY004
+    try:
+        validate(metadata)
+        return json.loads(json.dumps(metadata, allow_nan=False))
+    except (RecursionError, OverflowError) as exc:
+        raise ValueError("metadata must be a finite JSON object") from exc
+
+
+def normalize_chunk_metadata_batch(
+    metadata: Any, count: int
+) -> list[dict[str, Any]] | None:
+    """Broadcast one object or validate one metadata object per document."""
+    if metadata is None:
+        return None
+    if isinstance(metadata, dict):
+        metadata = [metadata] * count
+    if not isinstance(metadata, list) or len(metadata) != count:
+        raise ValueError("metadata must be an object or one object per document")
+    return [normalize_chunk_metadata(item) for item in metadata]
+
+
 def apply_trusted_sentence_split_regex(
     v_opts: dict[str, Any],
     addon_params: Any,
@@ -374,6 +417,7 @@ KG_RECOVERY_WARNINGS_METADATA_KEY = "kg_recovery_warnings"
 _DOC_STATUS_METADATA_CARRY_OVER_KEYS: tuple[str, ...] = (
     "process_options",
     "source_file",
+    "chunk_metadata",
     "parse_warnings",
     "chunk_opts",
     "parse_start_time",
@@ -596,6 +640,7 @@ def doc_status_transition_metadata(
 _DOC_STATUS_METADATA_DIRECTIVE_KEYS: tuple[str, ...] = (
     "process_options",
     "source_file",
+    "chunk_metadata",
     # Defense in depth: journaled custom-chunk patch rows are excluded from
     # pipeline processing/reset entirely, but if one ever reaches a reset the
     # journal must survive — stripping it would orphan the operation's staged
