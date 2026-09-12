@@ -2596,6 +2596,7 @@ async def pipeline_index_file(
     admission_token: str | None = None,
     ontology: dict[str, Any] | None = None,
     metadata: dict[str, Any] | None = None,
+    started: asyncio.Event | None = None,
 ):
     """Index a file with track_id
 
@@ -2608,6 +2609,9 @@ async def pipeline_index_file(
             instead of counting this request twice (LR2 §9.2)
         ontology: optional request-scoped entity extraction prompt profile
         metadata: custom JSON metadata copied to each generated chunk
+        started: optional startup barrier. When supplied, it is signalled after
+            the document enqueue has been persisted and before processing starts,
+            so callers can safely expose the track_id to status clients.
     """
     try:
         enqueue_kwargs = {"admission_token": admission_token}
@@ -2618,6 +2622,11 @@ async def pipeline_index_file(
         success, _ = await pipeline_enqueue_file(
             rag, file_path, track_id, **enqueue_kwargs
         )
+        # The upload endpoint must not return its track_id before the matching
+        # doc_status row is visible. Processing remains asynchronous: this
+        # signal only marks the end of the enqueue phase, not indexing.
+        if started is not None:
+            started.set()
         if success:
             await rag.apipeline_process_enqueue_documents()
 
@@ -5626,19 +5635,22 @@ def create_document_routes(
             # so concurrent uploads/inserts cooperate via the running
             # loop's quiescence decision.
             async def _indexing_work(started):
-                # started.set() first (no await before it) so the endpoint's
-                # start-barrier confirms takeover before returning; a body-send
-                # cancellation therefore cannot strand the enqueue slot.
-                started.set()
                 try:
                     index_kwargs = {
                         "admission_token": enqueue_token,
+                        "started": started,
                     }
                     if normalized_ontology is not None:
                         index_kwargs["ontology"] = normalized_ontology
                     if normalized_metadata is not None:
                         index_kwargs["metadata"] = normalized_metadata
                     await pipeline_index_file(rag, file_path, track_id, **index_kwargs)
+                    # Keep compatibility with injected/custom index callbacks
+                    # that do not consume the optional startup barrier. The
+                    # built-in implementation signals it immediately after
+                    # doc_status persistence, before this await returns.
+                    if not started.is_set():
+                        started.set()
                 finally:
                     await _release_enqueue_slot(rag, enqueue_token)
 
@@ -6583,7 +6595,11 @@ def create_document_routes(
         response_model=TrackStatusResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_track_status(track_id: str) -> TrackStatusResponse:
+    async def get_track_status(
+        track_id: str,
+        collection_name: str | None = None,
+        http_request: Request = None,
+    ) -> TrackStatusResponse:
         """
         Get the processing status of documents by tracking ID.
 
@@ -6592,6 +6608,8 @@ def create_document_routes(
 
         Args:
             track_id (str): The tracking ID returned from upload, text, or texts endpoints
+            collection_name (str | None): Collection used for the upload. Required
+                for collection-isolated API requests.
 
         Returns:
             TrackStatusResponse: A response object containing:
@@ -6609,8 +6627,26 @@ def create_document_routes(
 
             track_id = track_id.strip()
 
+            # Upload/text endpoints resolve a per-user/per-collection RAG before
+            # writing doc_status. The original implementation queried the base
+            # RAG here, so collection uploads were stored successfully but this
+            # endpoint searched the empty default workspace and returned 0 rows.
+            track_rag = rag
+            if rag_resolver is not None:
+                if not collection_name or not collection_name.strip():
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "collection_name is required when checking status "
+                            "for a collection-isolated upload"
+                        ),
+                    )
+                track_rag = await resolve_request_rag(
+                    http_request, collection_name.strip()
+                )
+
             # Get documents by track_id
-            docs_by_track_id = await rag.aget_docs_by_track_id(track_id)
+            docs_by_track_id = await track_rag.aget_docs_by_track_id(track_id)
 
             # Convert to response format
             documents = []

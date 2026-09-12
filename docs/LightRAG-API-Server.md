@@ -1290,6 +1290,13 @@ LightRAG implements asynchronous document indexing to enable frontend monitoring
 **Document Processing Status Query Endpoint:**
 * `/documents/track_status/{track_id}`
 
+For collection-isolated API requests, pass the same collection used during
+upload as a query parameter:
+
+```text
+/documents/track_status/{track_id}?collection_name=research
+```
+
 This endpoint provides comprehensive status information including:
 * Document processing status (pending/processing/processed/failed)
 * Content summary and metadata

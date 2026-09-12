@@ -3247,10 +3247,12 @@ async def start_reserved_background_task(
     """Start a background task that already holds a reservation and hand ownership
     to it safely.
 
-    ``work(started: asyncio.Event)`` MUST call ``started.set()`` as the first
-    statement inside its own ``try`` and release the reservation in its
-    ``finally``. ``backstop_release()`` is an owner-checked, idempotent release
-    used only if the child never takes over.
+    ``work(started: asyncio.Event)`` MUST call ``started.set()`` once the
+    reservation-holding work has reached its externally visible handoff point
+    and release the reservation in its ``finally``. The handoff point may be
+    after an awaited enqueue operation when the caller must not expose an
+    identifier before its persisted record exists. ``backstop_release()`` is an
+    owner-checked, idempotent release used only if the child never takes over.
 
     Returns the running task once the child has taken over (``started`` set). If
     this coroutine is cancelled before takeover, or the child ends before

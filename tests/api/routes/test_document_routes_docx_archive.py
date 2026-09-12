@@ -494,6 +494,106 @@ async def test_file_indexing_forwards_chunk_metadata(tmp_path, monkeypatch):
     )
 
 
+async def test_pipeline_index_file_signals_start_after_enqueue(
+    tmp_path, monkeypatch
+):
+    """A returned upload track_id must already identify a persisted document."""
+    import asyncio
+
+    file_path = tmp_path / "barrier.txt"
+    file_path.write_text("content", encoding="utf-8")
+    rag = _FakeRag()
+    started = asyncio.Event()
+    processing_started = asyncio.Event()
+    processing_gate = asyncio.Event()
+
+    async def _enqueue(*args, **kwargs):
+        # Model the real enqueue contract: doc_status is visible before the
+        # processing driver is allowed to begin.
+        rag.doc_status.docs["doc-barrier"] = {
+            "status": DocStatus.PENDING,
+            "file_path": str(file_path),
+            "track_id": args[2],
+        }
+        return True, args[2]
+
+    async def _process():
+        processing_started.set()
+        await processing_gate.wait()
+
+    monkeypatch.setattr(_document_routes, "pipeline_enqueue_file", _enqueue)
+    rag.apipeline_process_enqueue_documents = _process
+
+    task = asyncio.create_task(
+        pipeline_index_file(rag, file_path, "track-barrier", started=started)
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    assert rag.doc_status.docs["doc-barrier"]["track_id"] == "track-barrier"
+
+    await asyncio.wait_for(processing_started.wait(), timeout=1)
+    processing_gate.set()
+    await task
+
+
+async def test_track_status_resolves_collection_workspace(tmp_path):
+    """Collection uploads must be read from the same workspace they use to write."""
+    from fastapi import Request
+
+    class _TrackRag:
+        async def aget_docs_by_track_id(self, track_id):
+            return {}
+
+    base_rag = _TrackRag()
+    collection_rag = _TrackRag()
+    calls = []
+
+    async def resolver(user_id, collection_name):
+        calls.append((user_id, collection_name))
+        return collection_rag
+
+    router = create_document_routes(
+        base_rag, DocumentManager(str(tmp_path)), rag_resolver=resolver
+    )
+    endpoint = next(
+        route.endpoint
+        for route in router.routes
+        if route.name == "get_track_status"
+    )
+    request = Request({"type": "http", "state": {}})
+    request.state.user_id = "alice"
+
+    response = await endpoint(
+        "track-1", collection_name="research", http_request=request
+    )
+
+    assert response.track_id == "track-1"
+    assert calls == [("alice", "research")]
+
+
+async def test_track_status_requires_collection_for_isolated_workspace(tmp_path):
+    class _TrackRag:
+        async def aget_docs_by_track_id(self, track_id):
+            return {}
+
+    async def resolver(user_id, collection_name):
+        return _TrackRag()
+
+    router = create_document_routes(
+        _TrackRag(), DocumentManager(str(tmp_path)), rag_resolver=resolver
+    )
+    endpoint = next(
+        route.endpoint
+        for route in router.routes
+        if route.name == "get_track_status"
+    )
+
+    with pytest.raises(_document_routes.HTTPException) as error:
+        await endpoint("track-1")
+
+    assert error.value.status_code == 422
+
+
 async def test_upload_forwards_custom_metadata_before_background_indexing(
     tmp_path, monkeypatch
 ):
@@ -1544,7 +1644,11 @@ async def test_upload_accepts_c_when_custom_callback_is_injected(tmp_path, monke
     shared_storage = importlib.import_module("lightrag.kg.shared_storage")
     await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
 
-    async def _no_op_index(rag_arg, file_path, track_id=None, admission_token=None):
+    async def _no_op_index(
+        rag_arg, file_path, track_id=None, admission_token=None, started=None
+    ):
+        if started is not None:
+            started.set()
         return None
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _no_op_index)
@@ -1609,7 +1713,11 @@ async def test_upload_succeeds_concurrent_with_pipeline_busy(tmp_path, monkeypat
 
     gate = asyncio.Event()
 
-    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
+    async def _gated_index(
+        rag_arg, file_path, track_id=None, admission_token=None, started=None
+    ):
+        if started is not None:
+            started.set()
         await gate.wait()
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
@@ -1752,7 +1860,11 @@ async def test_upload_succeeds_during_scan_processing_phase(tmp_path, monkeypatc
 
     gate = asyncio.Event()
 
-    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
+    async def _gated_index(
+        rag_arg, file_path, track_id=None, admission_token=None, started=None
+    ):
+        if started is not None:
+            started.set()
         await gate.wait()
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
@@ -2685,7 +2797,11 @@ async def test_two_concurrent_uploads_both_succeed_when_pipeline_busy(
 
     gate = asyncio.Event()
 
-    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
+    async def _gated_index(
+        rag_arg, file_path, track_id=None, admission_token=None, started=None
+    ):
+        if started is not None:
+            started.set()
         await gate.wait()
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
@@ -3098,7 +3214,11 @@ async def test_upload_managed_task_released_on_shutdown_drain(tmp_path, monkeypa
 
     gate = asyncio.Event()
 
-    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
+    async def _gated_index(
+        rag_arg, file_path, track_id=None, admission_token=None, started=None
+    ):
+        if started is not None:
+            started.set()
         await gate.wait()
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)

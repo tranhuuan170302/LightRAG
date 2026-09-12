@@ -404,7 +404,9 @@ async def test_route_adopts_the_middleware_reservation_instead_of_taking_a_secon
     rag = await _rag(capacity=1, active=0)
     seen: dict = {}
 
-    async def _fake_index(rag_arg, file_path, track_id=None, admission_token=None):
+    async def _fake_index(
+        rag_arg, file_path, track_id=None, admission_token=None, started=None
+    ):
         seen["token"] = admission_token
         seen["tokens_during"] = await _tokens(rag)
 
